@@ -1,0 +1,300 @@
+---
+title: "nfip_policy_analysis"
+output: html_document
+---
+
+# Environment
+
+```{r}
+pacman::p_load(tidyverse, rfema, tidycensus, tigris, sf, leaflet)
+options(scipen = 999)
+comma <- function(x) {prettyNum(x, big.mark = ",")}
+
+coastal_counties <- c("28045", "28047", "28059")
+projection <- 4326
+```
+
+```{r}
+source("census_api_internal_only.R")
+```
+
+# Data
+
+## ACS Data - Blockgroup
+
+```{r}
+acs5 <- 
+  get_acs(
+    geography = "block group", 
+    variables = c(
+      housing_units = "B25001_001",
+      occupied_housing_units = "B25002_002"
+      ),
+    state = "MS",
+    survey = "acs5", 
+    output = "wide",
+    key = api,
+    cache_table = T,
+    geometry = T
+  ) %>%
+  transmute(
+    countyid = str_sub(GEOID, 1, 5),
+    blockgroupid = GEOID,
+    housing_units_bg = housing_unitsE,
+    occupied_housing_units_bg = occupied_housing_unitsE
+  ) %>%
+  filter(countyid %in% coastal_counties)
+```
+
+## Boundaries
+
+```{r}
+counties <- 
+  counties(state = "MS", year = 2025, cb = T) %>%
+  filter(GEOID %in% coastal_counties) %>%
+  select(county_name = NAME) %>%
+  st_transform(projection)
+
+cities <- 
+  places(state = "MS", year = 2025, cb = T) %>%
+  select(city_name = NAME) %>%
+  st_transform(projection) %>%
+  st_join(counties %>%
+            select(county_name), 
+          join = st_within, left = F) 
+```
+
+## Open FEMA NFIP Policy Data
+
+OpenFEMA NFIP Policy Data [Documentation](https://www.fema.gov/openfema-data-page/nfip-redacted-policies-v3)
+
+```{r}
+datasets <- fema_data_sets()
+fields <- fema_data_fields("NFIPPolicies") 
+parameter_values("NFIPPolicies", data_field = "policyTerminationDate")
+```
+
+```{r}
+as_of_date <- today()
+```
+
+```{r}
+nfip_policies_raw <-
+  open_fema("NfipPolicies", 
+            filters = list(
+              propertyState = "MS",
+              policyTerminationDate = str_c(">= ",as_of_date)
+            )
+            )
+```
+
+```{r}
+sort(unique(nfip_policies_raw$occupancyType))
+
+single_family <- c(1, 11, 14)
+two_to_four_family = c(2, 12)
+multi_family <- c(3, 13, 15, 16)
+non_residential <- c(4, 6, 17, 18, 19)
+```
+
+```{r}
+nfip_policy <- 
+  nfip_policies_raw %>%
+  transmute(
+    #policy dates
+    across(c(policyEffectiveDate,
+             policyTerminationDate,
+             cancellationDateOfFloodPolicy), ~ as.Date(.x)), 
+    #GEOIDs
+    countyCode = str_sub(censusGeoid, 1, 5),
+    nfipCommunityName,
+    nfipRatedCommunityNumber,
+    blockgroupid = censusGeoid,
+    
+    #effective policy indicator
+    effective = ifelse(
+      policyEffectiveDate <= as_of_date &
+      policyTerminationDate >= as_of_date &
+        (cancellationDateOfFloodPolicy >= as_of_date |
+           is.na(cancellationDateOfFloodPolicy)), 1, 0
+    ),
+    
+    #occupancy type
+    single_family = 
+      ifelse(occupancyType %in% single_family, 1, 0),
+    two_to_four_family = 
+      ifelse(occupancyType %in% two_to_four_family, 1, 0),
+    multi_family = 
+      ifelse(occupancyType %in% multi_family, 1, 0),
+    non_residential = 
+      ifelse(occupancyType %in% non_residential, 1, 0),
+    occupancy_type = case_when(
+      single_family == 1 ~ "Single Family",
+      two_to_four_family == 1 ~ "2-4 Family",
+      multi_family == 1 ~ "All Other Residential",
+      non_residential == 1 ~ "Non-Residential"
+    ) %>%
+      factor(levels = c("Single Family", "2-4 Family", 
+                        "All Other Residential", "Non-Residential")),
+    
+    residential = 
+      ifelse(single_family == 1 |
+               two_to_four_family == 1 |
+               multi_family == 1, 1, 0),
+    
+    #premium and coverage
+    totalInsurancePremiumOfThePolicy = as.numeric(totalInsurancePremiumOfThePolicy),
+    totalBuildingInsuranceCoverage = as.numeric(totalBuildingInsuranceCoverage),
+    totalContentsInsuranceCoverage = as.numeric(totalContentsInsuranceCoverage),
+    total_coverage = totalBuildingInsuranceCoverage +totalContentsInsuranceCoverage
+  ) %>%
+  filter(
+    effective == 1 &
+    countyCode %in% coastal_counties 
+    # nfipRatedCommunityNumber == "220139"
+    )
+
+```
+
+# Table
+
+```{r}
+nfip_policy %>%
+  group_by(occupancy_type) %>% 
+  summarize(
+    number_policies = n(),
+    total_premium = sum(totalInsurancePremiumOfThePolicy), 
+    insurance_in_force = sum(total_coverage),
+    .groups = "drop"
+    ) %>%
+  bind_rows(
+    tibble(
+      occupancy_type = "Total",
+      number_policies = nrow(nfip_policy),
+      total_premium = sum(nfip_policy$totalInsurancePremiumOfThePolicy), 
+      insurance_in_force = sum(nfip_policy$total_coverage)
+      )
+    ) %>%
+  transmute(
+    'Occupancy Type' = occupancy_type,
+    'Number of Policies in Force' = comma(number_policies),
+    'Total Premium' = comma(total_premium),
+    'Insurance in Force' = comma(insurance_in_force)
+    )
+
+```
+
+# Maps
+
+```{r}
+nfip_policy_bg <-
+  nfip_policy %>%
+  group_by(blockgroupid) %>%
+  summarize(
+    effective_bg = sum(effective[nfip_policy$residential == 1], na.rm = T)
+  )
+
+nfip_policy_sf <-
+  inner_join(acs5, nfip_policy_bg, by = "blockgroupid") %>%
+  st_transform(projection) %>%
+  mutate(
+    effective_per_res = effective_bg / housing_units_bg * 100
+  )
+```
+
+```{r}
+pal <- colorBin(
+    palette = c(
+    "#EEFFFB",
+    "#A4DEDD",
+    "#4892A7",
+    "#2C5474"
+  ),
+  bins = c(0, 10, 25, 50, Inf)
+)
+
+pal_effective <- colorBin(
+    palette = c(
+    "#F4FFFE",
+    "#E0FFF9",
+    "#A4DEDD",
+    "#4892A7",
+    "#2C5474"
+  ),
+  bins = c(0, 10, 50, 100, 150, Inf)
+)
+```
+
+```{r}
+nfip_policy_map <-
+leaflet() %>%
+  addMapPane("nfip", zIndex = 410) %>%
+  addMapPane("boundaries",   zIndex = 420) %>%
+  
+  addProviderTiles("Esri.WorldGrayCanvas") %>%
+  setView(lng = -89.00, lat = 30.55, zoom = 9.25) %>%
+  addPolygons(
+    data = nfip_policy_sf,
+    group = "Residential Policies per Housing Unit",
+    stroke = T,
+    color = "#FFF",
+    weight = .75, 
+    fillOpacity = .75,
+    fillColor = ~pal(effective_per_res), 
+    popup = ~str_c(
+      "<strong>Effective NFIP Policies:</strong> ",
+      effective_per_res
+    ),
+    options = pathOptions(pane = "nfip")
+  ) %>%
+  # Raw effective policies
+  addPolygons(
+    data = nfip_policy_sf,
+    group = "Total Number of Effetive Policies",
+    stroke = T,
+    color = "#FFF",
+    weight = 0.75,
+    fillOpacity = 0.85,
+    fillColor = ~pal_effective(effective_bg),
+    popup = ~str_c(
+      "<strong>Effective NFIP Policies:</strong> ",
+      effective_bg
+    ),
+    options = pathOptions(pane = "nfip")
+  ) %>%
+  
+  addLayersControl(
+    baseGroups = c(
+      "Total Number of Effetive Policies",
+      "Residential Policies per Housing Unit"
+      
+    ),
+    options = layersControlOptions(collapsed = F)
+  ) %>%
+  
+  hideGroup("Residential Policies per Housing Unit") %>%
+  
+  #county and city boundaries
+  addPolygons(
+    data = counties,
+    stroke = T,
+    weight = 1,
+    color = "#2F3B52",
+    fill = F,
+    options = pathOptions(pane = "boundaries")
+  ) %>%
+  addPolygons(
+    data = cities,
+    stroke = T,
+    weight = .5,
+    color = "#2F3B52",
+    fillColor = "transparent",
+    options = pathOptions(pane = "boundaries")
+    )
+```
+
+```{r}
+saveRDS(
+  nfip_policy_map,
+  "02_maps/ms_coast_nfip.rds")
+```
