@@ -232,7 +232,7 @@ leaflet() %>%
   addMapPane("boundaries",   zIndex = 420) %>%
   
   addProviderTiles("Esri.WorldGrayCanvas") %>%
-  setView(lng = -89.00, lat = 30.55, zoom = 9.25) %>%
+  setView(lng = -89.00, lat = 30.55, zoom = 9.225) %>%
   addPolygons(
     data = nfip_policy_sf,
     group = "Residential Policies per Housing Unit",
@@ -250,7 +250,7 @@ leaflet() %>%
   # Raw effective policies
   addPolygons(
     data = nfip_policy_sf,
-    group = "Total Number of Effetive Policies",
+    group = "Total Number of Effective Policies",
     stroke = T,
     color = "#FFF",
     weight = 0.75,
@@ -265,7 +265,7 @@ leaflet() %>%
   
   addLayersControl(
     baseGroups = c(
-      "Total Number of Effetive Policies",
+      "Total Number of Effective Policies",
       "Residential Policies per Housing Unit"
       
     ),
